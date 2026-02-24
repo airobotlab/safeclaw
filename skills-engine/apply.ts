@@ -1,8 +1,9 @@
-import { execSync } from 'child_process';
+import { execFileSync, execSync } from 'child_process';
 import crypto from 'crypto';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
+import readline from 'readline';
 
 import { clearBackup, createBackup, restoreBackup } from './backup.js';
 import { NANOCLAW_DIR } from './constants.js';
@@ -18,7 +19,14 @@ import {
   readManifest,
 } from './manifest.js';
 import { loadPathRemap, resolvePathRemap } from './path-remap.js';
-import { mergeFile } from './merge.js';
+import {
+  cleanupMergeState,
+  isGitRepo,
+  mergeFile,
+  runRerere,
+  setupRerereAdapter,
+} from './merge.js';
+import { loadResolutions } from './resolution-cache.js';
 import { computeFileHash, readState, recordSkillApplication, writeState } from './state.js';
 import {
   mergeDockerComposeServices,
@@ -164,6 +172,10 @@ export async function applySkill(skillDir: string): Promise<ApplyResult> {
     // --- Merge modified files ---
     const mergeConflicts: string[] = [];
 
+    // Load pre-computed resolutions into git's rr-cache before merging
+    const appliedSkillNames = currentState.applied_skills.map((s) => s.name);
+    loadResolutions([...appliedSkillNames, manifest.skill], projectRoot, skillDir);
+
     for (const relPath of manifest.modifies) {
       const resolvedPath = resolvePathRemap(relPath, pathRemap);
       const currentPath = path.join(projectRoot, resolvedPath);
@@ -189,6 +201,8 @@ export async function applySkill(skillDir: string): Promise<ApplyResult> {
       }
 
       // Three-way merge: current ← base → skill
+      // Save current content before merge overwrites it (needed for rerere stage 2 = "ours")
+      const oursContent = fs.readFileSync(currentPath, 'utf-8');
       // git merge-file modifies the first argument in-place, so use a temp copy
       const tmpCurrent = path.join(
         os.tmpdir(),
@@ -202,9 +216,36 @@ export async function applySkill(skillDir: string): Promise<ApplyResult> {
         fs.copyFileSync(tmpCurrent, currentPath);
         fs.unlinkSync(tmpCurrent);
       } else {
-        // Conflict — copy markers to working tree
+        // Copy conflict markers to working tree path BEFORE rerere
+        // rerere looks at the working tree file at relPath, not at tmpCurrent
         fs.copyFileSync(tmpCurrent, currentPath);
         fs.unlinkSync(tmpCurrent);
+
+        if (isGitRepo()) {
+          const baseContent = fs.readFileSync(basePath, 'utf-8');
+          const theirsContent = fs.readFileSync(skillPath, 'utf-8');
+
+          setupRerereAdapter(resolvedPath, baseContent, oursContent, theirsContent);
+          const autoResolved = runRerere(currentPath);
+
+          if (autoResolved) {
+            // rerere resolved the conflict — currentPath now has resolved content
+            // Record the resolution: git add + git rerere
+            execFileSync('git', ['add', resolvedPath], { stdio: 'pipe' });
+            execSync('git rerere', { stdio: 'pipe' });
+            cleanupMergeState(resolvedPath);
+            // Unstage the file — cleanupMergeState clears unmerged entries
+            // but the git add above leaves the file staged at stage 0
+            try {
+              execFileSync('git', ['restore', '--staged', resolvedPath], { stdio: 'pipe' });
+            } catch { /* may fail if file is new or not tracked */ }
+            continue;
+          }
+
+          cleanupMergeState(resolvedPath);
+        }
+
+        // Unresolved conflict — currentPath already has conflict markers
         mergeConflicts.push(relPath);
       }
     }
@@ -220,6 +261,100 @@ export async function applySkill(skillDir: string): Promise<ApplyResult> {
         untrackedChanges: driftFiles.length > 0 ? driftFiles : undefined,
         error: `Merge conflicts in: ${mergeConflicts.join(', ')}. Resolve manually then run recordSkillApplication(). Call clearBackup() after resolution or restoreBackup() + clearBackup() to abort.`,
       };
+    }
+
+    // --- Security Layer 2: Diff approval ---
+    // Show all changes and require explicit user approval before proceeding
+    if (!process.env.NANOCLAW_SKIP_DIFF_APPROVAL) {
+      console.log('\n╔══════════════════════════════════════════╗');
+      console.log('║  SECURITY: Code change review required   ║');
+      console.log('╚══════════════════════════════════════════╝\n');
+      console.log(`Skill "${manifest.skill}" will make the following changes:\n`);
+
+      // Show added files
+      if (manifest.adds.length > 0) {
+        console.log('  [NEW FILES]');
+        for (const relPath of manifest.adds) {
+          const resolvedPath = resolvePathRemap(relPath, pathRemap);
+          console.log(`    + ${resolvedPath}`);
+        }
+        console.log('');
+      }
+
+      // Show modified files with diffs
+      if (manifest.modifies.length > 0) {
+        console.log('  [MODIFIED FILES]');
+        for (const relPath of manifest.modifies) {
+          const resolvedPath = resolvePathRemap(relPath, pathRemap);
+          const currentPath = path.join(projectRoot, resolvedPath);
+          const basePath = path.join(projectRoot, NANOCLAW_DIR, 'base', resolvedPath);
+          if (fs.existsSync(currentPath) && fs.existsSync(basePath)) {
+            try {
+              const diff = execSync(
+                `git diff --no-index -- "${basePath}" "${currentPath}"`,
+                { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] },
+              );
+              console.log(`    ~ ${resolvedPath}`);
+              if (diff.trim()) {
+                for (const line of diff.split('\n').slice(4)) {
+                  console.log(`      ${line}`);
+                }
+              }
+            } catch (diffErr: any) {
+              // git diff returns exit code 1 when files differ
+              if (diffErr.stdout) {
+                console.log(`    ~ ${resolvedPath}`);
+                for (const line of diffErr.stdout.split('\n').slice(4)) {
+                  console.log(`      ${line}`);
+                }
+              } else {
+                console.log(`    ~ ${resolvedPath} (diff unavailable)`);
+              }
+            }
+          } else {
+            console.log(`    ~ ${resolvedPath}`);
+          }
+        }
+        console.log('');
+      }
+
+      // Show structured changes
+      if (manifest.structured?.npm_dependencies) {
+        console.log('  [NPM DEPENDENCIES]');
+        for (const [pkg, ver] of Object.entries(manifest.structured.npm_dependencies)) {
+          console.log(`    + ${pkg}: ${ver}`);
+        }
+        console.log('');
+      }
+
+      if (manifest.post_apply && manifest.post_apply.length > 0) {
+        console.log('  [POST-APPLY COMMANDS]');
+        for (const cmd of manifest.post_apply) {
+          console.log(`    $ ${cmd}`);
+        }
+        console.log('');
+      }
+
+      // Ask for approval
+      const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+      const answer = await new Promise<string>((resolve) => {
+        rl.question('Apply these changes? (yes/no): ', resolve);
+      });
+      rl.close();
+
+      if (answer.trim().toLowerCase() !== 'yes' && answer.trim().toLowerCase() !== 'y') {
+        for (const f of addedFiles) {
+          try { if (fs.existsSync(f)) fs.unlinkSync(f); } catch {}
+        }
+        restoreBackup();
+        clearBackup();
+        return {
+          success: false,
+          skill: manifest.skill,
+          version: manifest.version,
+          error: 'User rejected changes during diff approval',
+        };
+      }
     }
 
     // --- Structured operations ---

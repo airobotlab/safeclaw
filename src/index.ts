@@ -11,6 +11,7 @@ import {
 import { WhatsAppChannel } from './channels/whatsapp.js';
 import {
   ContainerOutput,
+  ensureSkillsReviewed,
   runContainerAgent,
   writeGroupsSnapshot,
   writeTasksSnapshot,
@@ -35,6 +36,7 @@ import { GroupQueue } from './group-queue.js';
 import { resolveGroupFolderPath } from './group-folder.js';
 import { startIpcWatcher } from './ipc.js';
 import { findChannel, formatMessages, formatOutbound } from './router.js';
+import { ensureDefaultAllowlist } from './network-policy.js';
 import { startSchedulerLoop } from './task-scheduler.js';
 import { Channel, NewMessage, RegisteredGroup } from './types.js';
 import { logger } from './logger.js';
@@ -422,6 +424,8 @@ function ensureContainerSystemRunning(): void {
 
 async function main(): Promise<void> {
   ensureContainerSystemRunning();
+  ensureDefaultAllowlist();
+  await ensureSkillsReviewed();
   initDatabase();
   logger.info('Database initialized');
   loadState();

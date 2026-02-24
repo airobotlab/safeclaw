@@ -20,7 +20,25 @@ import { resolveGroupFolderPath, resolveGroupIpcPath } from './group-folder.js';
 import { logger } from './logger.js';
 import { CONTAINER_RUNTIME_BIN, readonlyMountArgs, stopContainer } from './container-runtime.js';
 import { validateAdditionalMounts } from './mount-security.js';
+import { getNetworkArgs } from './network-policy.js';
+import { reviewSkillDirectory } from './skill-review.js';
 import { RegisteredGroup } from './types.js';
+
+let _skillsReviewPassed = false;
+
+/**
+ * Review all container skills at startup via LLM (Security Layer 1).
+ * Must be called before any container is spawned.
+ */
+export async function ensureSkillsReviewed(): Promise<void> {
+  const skillsSrc = path.join(process.cwd(), 'container', 'skills');
+  _skillsReviewPassed = await reviewSkillDirectory(skillsSrc);
+  if (!_skillsReviewPassed) {
+    logger.error('SECURITY: One or more skill files failed LLM review. Skills will NOT be synced to containers.');
+  } else {
+    logger.info('All skill files passed LLM security review');
+  }
+}
 
 // Sentinel markers for robust output parsing (must match agent-runner)
 const OUTPUT_START_MARKER = '---NANOCLAW_OUTPUT_START---';
@@ -123,9 +141,10 @@ function buildVolumeMounts(
   }
 
   // Sync skills from container/skills/ into each group's .claude/skills/
+  // Skills are pre-reviewed by LLM in ensureSkillsReviewed() at startup
   const skillsSrc = path.join(process.cwd(), 'container', 'skills');
   const skillsDst = path.join(groupSessionsDir, 'skills');
-  if (fs.existsSync(skillsSrc)) {
+  if (fs.existsSync(skillsSrc) && _skillsReviewPassed) {
     for (const skillDir of fs.readdirSync(skillsSrc)) {
       const srcDir = path.join(skillsSrc, skillDir);
       if (!fs.statSync(srcDir).isDirectory()) continue;
@@ -186,20 +205,24 @@ function readSecrets(): Record<string, string> {
   return readEnvFile(['CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_API_KEY']);
 }
 
-function buildContainerArgs(mounts: VolumeMount[], containerName: string): string[] {
+async function buildContainerArgs(mounts: VolumeMount[], containerName: string): Promise<string[]> {
   const args: string[] = ['run', '-i', '--rm', '--name', containerName];
 
   // Pass host timezone so container's local time matches the user's
   args.push('-e', `TZ=${TIMEZONE}`);
 
-  // Run as host user so bind-mounted files are accessible.
-  // Skip when running as root (uid 0), as the container's node user (uid 1000),
-  // or when getuid is unavailable (native Windows without WSL).
+  // Security Layer 3: network egress whitelist
+  const networkArgs = await getNetworkArgs();
+  args.push(...networkArgs);
+
+  // Pass host UID/GID so the entrypoint can map the node user to the host user.
+  // This ensures bind-mounted files have correct ownership.
+  // The entrypoint runs as root (for iptables), then drops to node user with mapped UID.
   const hostUid = process.getuid?.();
   const hostGid = process.getgid?.();
   if (hostUid != null && hostUid !== 0 && hostUid !== 1000) {
-    args.push('--user', `${hostUid}:${hostGid}`);
-    args.push('-e', 'HOME=/home/node');
+    args.push('-e', `HOST_UID=${hostUid}`);
+    args.push('-e', `HOST_GID=${hostGid}`);
   }
 
   for (const mount of mounts) {
@@ -229,7 +252,7 @@ export async function runContainerAgent(
   const mounts = buildVolumeMounts(group, input.isMain);
   const safeName = group.folder.replace(/[^a-zA-Z0-9-]/g, '-');
   const containerName = `nanoclaw-${safeName}-${Date.now()}`;
-  const containerArgs = buildContainerArgs(mounts, containerName);
+  const containerArgs = await buildContainerArgs(mounts, containerName);
 
   logger.debug(
     {

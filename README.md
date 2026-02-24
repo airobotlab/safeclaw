@@ -1,179 +1,229 @@
 <p align="center">
-  <img src="assets/nanoclaw-logo.png" alt="NanoClaw" width="400">
+  <img src="assets/nanoclaw-logo.png" alt="SafeClaw" width="400">
 </p>
 
 <p align="center">
-  An AI assistant that runs agents securely in their own containers. Lightweight, built to be easily understood and completely customized for your needs.
+  <strong>SafeClaw</strong> — Security-hardened fork of <a href="https://github.com/qwibitai/NanoClaw">NanoClaw</a>. Container isolation + 3-layer defense-in-depth.
 </p>
 
 <p align="center">
   <a href="https://nanoclaw.dev">nanoclaw.dev</a>&nbsp; • &nbsp;
-  <a href="README_zh.md">中文</a>&nbsp; • &nbsp;
-  <a href="https://discord.gg/VDdww8qS42"><img src="https://img.shields.io/discord/1470188214710046894?label=Discord&logo=discord&v=2" alt="Discord" valign="middle"></a>&nbsp; • &nbsp;
-  <a href="repo-tokens"><img src="repo-tokens/badge.svg" alt="34.9k tokens, 17% of context window" valign="middle"></a>
+  <a href="https://discord.gg/VDdww8qS42"><img src="https://img.shields.io/discord/1470188214710046894?label=Discord&logo=discord&v=2" alt="Discord" valign="middle"></a>
 </p>
 
-Using Claude Code, NanoClaw can dynamically rewrite its code to customize its feature set for your needs.
+## OpenClaw vs SafeClaw
 
-**New:** First AI assistant to support [Agent Swarms](https://code.claude.com/docs/en/agent-teams). Spin up teams of agents that collaborate in your chat.
+| | OpenClaw | SafeClaw |
+|---|---|---|
+| **Philosophy** | Maximize agent reach | Restrict agent reach at OS level, control code changes |
+| **Codebase** | ~400K lines, 45+ deps | ~500 lines core, 35K tokens total |
+| **Integrations** | 50+ built-in, 700+ community skills | WhatsApp only (add more via skills) |
+| **LLM support** | Multi-LLM | Anthropic Claude Agent SDK only |
+| **Isolation** | Application-level (allowlists, pairing codes) | OS-level container per group + 3 security layers |
+| **Runtime** | Single Node process, shared memory | Host orchestrator + isolated Linux containers |
+| **Auditability** | Practically impossible (400K lines) | Full audit in ~8 minutes |
 
-## Why I Built NanoClaw
+## Why This Exists
 
-[OpenClaw](https://github.com/openclaw/openclaw) is an impressive project, but I wouldn't have been able to sleep if I had given complex software I didn't understand full access to my life. OpenClaw has nearly half a million lines of code, 53 config files, and 70+ dependencies. Its security is at the application level (allowlists, pairing codes) rather than true OS-level isolation. Everything runs in one Node process with shared memory.
+OpenClaw is impressive — 50+ integrations, hundreds of community skills, multi-LLM support. But all of that runs in **one Node process with shared memory**, and security is enforced at the application level (allowlists, pairing codes). This creates structural problems:
 
-NanoClaw provides that same core functionality, but in a codebase small enough to understand: one process and a handful of files. Claude agents run in their own Linux containers with filesystem isolation, not merely behind permission checks.
+| Threat | OpenClaw | Why it's a problem |
+|--------|----------|-------------------|
+| **Host filesystem destruction** | Agent runs directly on host | A bad command or malicious skill can delete system files or format disk |
+| **Unauthorized email/message sending** | 50+ integrations always connected | With Gmail installed, a malicious skill can silently send emails |
+| **Unlimited data exfiltration** | No network restrictions | Agent can send any accessible data to any external server |
+| **Unauditable codebase** | 400K lines + 700+ community skills | Nobody actually reviews everything. The open-source trust assumption breaks down |
+| **No privilege isolation** | Application-level security only | Bypassable. One breach exposes all connected integrations |
+
+SafeClaw takes the opposite approach: **minimize the attack surface, isolate at the OS level, and verify every change.**
+
+## SafeClaw Security Architecture
+
+### Existing NanoClaw Protections (Container Isolation)
+
+NanoClaw already provides strong baseline security:
+
+- **Per-group isolated containers** — macOS: Apple Container/VM, Linux: Docker
+- **Explicit mount only** — only mounted directories are accessible; host filesystem is invisible
+- **Root escape proof** — even with root inside the container, host is unreachable
+- **No implicit integrations** — Gmail doesn't exist unless you install it; no email sending without the skill
+- **Auditable in 8 minutes** — 500 lines of core logic, fully reviewable
+
+### What Was Missing
+
+| Gap | Risk |
+|-----|------|
+| **No skill trust verification** | Skill files are markdown instructions — malicious directives hidden in natural language can't be caught by static analysis |
+| **Code changes applied without approval** | Claude Code modifies source based on skills with no user confirmation — if the code gets poisoned, the container faithfully executes malicious behavior |
+| **No network restriction** | Containers have full outbound internet access — if the above two are breached, data can flow to any external server |
+
+### The 3 Security Layers SafeClaw Adds
+
+#### Layer 1: Skill File LLM Pre-Review
+
+On startup, a separate LLM call reviews every skill markdown file for:
+
+- Instructions to exfiltrate data to external servers/URLs
+- Credential or secret file access patterns
+- Obfuscated commands or encoded payloads (base64, hex, etc.)
+- Container escape or host modification instructions
+- Hidden instructions in comments or invisible characters
+
+Results are **cached by SHA256 file hash** — unchanged skills skip review. If any skill fails, it is **not synced** to containers.
+
+```
+[startup] Reviewing skill file with LLM...
+[startup] All skill files passed LLM security review
+```
+
+Not perfect, but catches blatant malicious instructions as a first gate.
+
+#### Layer 2: Code Change Diff Approval (The Key Layer)
+
+When applying a skill via the skills-engine, **all changes are shown as a diff before they take effect**:
+
+```
+╔══════════════════════════════════════════╗
+║  SECURITY: Code change review required   ║
+╚══════════════════════════════════════════╝
+
+Skill "add-telegram" will make the following changes:
+
+  [NEW FILES]
+    + src/channels/telegram.ts
+
+  [MODIFIED FILES]
+    ~ src/index.ts
+      +import { TelegramChannel } from './channels/telegram.js';
+      ...
+
+  [NPM DEPENDENCIES]
+    + telegraf: ^4.16.0
+
+  [POST-APPLY COMMANDS]
+    $ npm run build
+
+Apply these changes? (yes/no):
+```
+
+The user must type `yes`. Reject → automatic rollback.
+
+This is the most critical layer: **no matter what a skill instructs, the final code change must pass human review.** A malicious skill that tries to sneak in Gmail exfiltration code will be visible in the diff.
+
+Set `NANOCLAW_SKIP_DIFF_APPROVAL=1` for CI/automation.
+
+#### Layer 3: Container Network Egress Whitelist
+
+Containers can **only connect to whitelisted domains**. Enforced via iptables inside the container — the entrypoint runs as root to configure the firewall, then drops to the `node` user.
+
+Default allowed:
+- `api.anthropic.com` — Claude API calls
+- `cdn.anthropic.com` — SDK resources
+- `sentry.io` — error reporting
+- `statsig.anthropic.com` — feature flags
+
+Everything else is **DROP**ped. Even if layers 1 and 2 are breached, data cannot reach unknown external servers.
+
+Config at `~/.config/nanoclaw/network-allowlist.json`:
+
+```json
+{
+  "enabled": true,
+  "allowed_domains": [
+    "api.anthropic.com",
+    "cdn.anthropic.com",
+    "sentry.io",
+    "statsig.anthropic.com"
+  ]
+}
+```
+
+## Threat Comparison
+
+| Threat | OpenClaw | SafeClaw |
+|--------|----------|------------|
+| Host file deletion/format | **Possible** (runs on host) | **Impossible** (container isolation) |
+| Silent email/message sending | **Possible** (50+ integrations always connected) | **Impossible** without skill install + **diff approval required** |
+| Malicious skill injection | **Hard to detect** (400K line codebase) | **Layer 1** LLM review + **Layer 2** diff approval |
+| Data exfiltration | **No restriction** | **Layer 3** network whitelist blocks unknown destinations |
+| Full code audit | **Practically impossible** | 500 lines, **8 minutes** |
+
+## Irreducible Threats
+
+These exist in **any** agent framework and are not solvable at the NanoClaw level:
+
+| Threat | Why it's irreducible |
+|--------|---------------------|
+| API key must exist | Agent needs it to function |
+| Mounted directories are exposed | Agent must read/write files to be useful |
+| Host orchestrator runs outside container | Container management requires host access; this is OS security territory |
+| Claude Agent SDK trust | If you don't trust the SDK, there's no reason to use the framework |
+
+## Combined Defense
+
+For an attack to succeed against SafeClaw, it must simultaneously:
+
+1. **Fool the LLM review** — craft a skill that passes automated security audit
+2. **Fool the human reviewer** — hide malicious code in a diff that gets approved
+3. **Exfiltrate via whitelisted domains only** — no arbitrary outbound connections
+
+All three conditions at once is practically infeasible.
+
+## What Changed (vs upstream NanoClaw)
+
+| File | Change |
+|------|--------|
+| `src/skill-review.ts` | **New** — LLM skill review engine with SHA256 caching |
+| `src/network-policy.ts` | **New** — Network allowlist management and DNS resolution |
+| `container/entrypoint.sh` | **New** — iptables firewall setup + privilege drop |
+| `src/container-runner.ts` | Skill review gate, async network args, `HOST_UID`/`HOST_GID` env mapping |
+| `src/index.ts` | Startup calls for skill review and network allowlist init |
+| `skills-engine/apply.ts` | Interactive diff approval step before code changes |
+| `container/Dockerfile` | Added `iptables`, external entrypoint, root start for firewall setup |
+
+All original NanoClaw functionality is preserved. Changes are additive only.
 
 ## Quick Start
 
 ```bash
-git clone https://github.com/qwibitai/NanoClaw.git
-cd NanoClaw
+git clone https://github.com/airobotlab/SafeClaw.git
+cd SafeClaw
 claude
 ```
 
-Then run `/setup`. Claude Code handles everything: dependencies, authentication, container setup and service configuration.
+Then run `/setup`. Claude Code handles dependencies, authentication, container build, and service configuration.
 
-## Philosophy
+After setup, rebuild the container to include the iptables firewall:
 
-**Small enough to understand.** One process, a few source files and no microservices. If you want to understand the full NanoClaw codebase, just ask Claude Code to walk you through it.
-
-**Secure by isolation.** Agents run in Linux containers (Apple Container on macOS, or Docker) and they can only see what's explicitly mounted. Bash access is safe because commands run inside the container, not on your host.
-
-**Built for the individual user.** NanoClaw isn't a monolithic framework; it's software that fits each user's exact needs. Instead of becoming bloatware, NanoClaw is designed to be bespoke. You make your own fork and have Claude Code modify it to match your needs.
-
-**Customization = code changes.** No configuration sprawl. Want different behavior? Modify the code. The codebase is small enough that it's safe to make changes.
-
-**AI-native.**
-- No installation wizard; Claude Code guides setup.
-- No monitoring dashboard; ask Claude what's happening.
-- No debugging tools; describe the problem and Claude fixes it.
-
-**Skills over features.** Instead of adding features (e.g. support for Telegram) to the codebase, contributors submit [claude code skills](https://code.claude.com/docs/en/skills) like `/add-telegram` that transform your fork. You end up with clean code that does exactly what you need.
-
-**Best harness, best model.** NanoClaw runs on the Claude Agent SDK, which means you're running Claude Code directly. Claude Code is highly capable and its coding and problem-solving capabilities allow it to modify and expand NanoClaw and tailor it to each user.
-
-## What It Supports
-
-- **Messenger I/O** - Message NanoClaw from your phone. Supports WhatsApp, Telegram, Discord, Slack, Signal and headless operation.
-- **Isolated group context** - Each group has its own `CLAUDE.md` memory, isolated filesystem, and runs in its own container sandbox with only that filesystem mounted to it.
-- **Main channel** - Your private channel (self-chat) for admin control; every group is completely isolated
-- **Scheduled tasks** - Recurring jobs that run Claude and can message you back
-- **Web access** - Search and fetch content from the Web
-- **Container isolation** - Agents are sandboxed in Apple Container (macOS) or Docker (macOS/Linux)
-- **Agent Swarms** - Spin up teams of specialized agents that collaborate on complex tasks. NanoClaw is the first personal AI assistant to support agent swarms.
-- **Optional integrations** - Add Gmail (`/add-gmail`) and more via skills
-
-## Usage
-
-Talk to your assistant with the trigger word (default: `@Andy`):
-
-```
-@Andy send an overview of the sales pipeline every weekday morning at 9am (has access to my Obsidian vault folder)
-@Andy review the git history for the past week each Friday and update the README if there's drift
-@Andy every Monday at 8am, compile news on AI developments from Hacker News and TechCrunch and message me a briefing
+```bash
+./container/build.sh
 ```
 
-From the main channel (your self-chat), you can manage groups and tasks:
+## Keeping Up with Upstream
+
+This fork merges cleanly with upstream NanoClaw:
+
+```bash
+git remote add upstream https://github.com/qwibitai/NanoClaw.git
+git fetch upstream
+git merge upstream/main
 ```
-@Andy list all scheduled tasks across groups
-@Andy pause the Monday briefing task
-@Andy join the Family Chat group
-```
 
-## Customizing
-
-NanoClaw doesn't use configuration files. To make changes, just tell Claude Code what you want:
-
-- "Change the trigger word to @Bob"
-- "Remember in the future to make responses shorter and more direct"
-- "Add a custom greeting when I say good morning"
-- "Store conversation summaries weekly"
-
-Or run `/customize` for guided changes.
-
-The codebase is small enough that Claude can safely modify it.
-
-## Contributing
-
-**Don't add features. Add skills.**
-
-If you want to add Telegram support, don't create a PR that adds Telegram alongside WhatsApp. Instead, contribute a skill file (`.claude/skills/add-telegram/SKILL.md`) that teaches Claude Code how to transform a NanoClaw installation to use Telegram.
-
-Users then run `/add-telegram` on their fork and get clean code that does exactly what they need, not a bloated system trying to support every use case.
-
-### RFS (Request for Skills)
-
-Skills we'd like to see:
-
-**Communication Channels**
-- `/add-slack` - Add Slack
-
-**Session Management**
-- `/clear` - Add a `/clear` command that compacts the conversation (summarizes context while preserving critical information in the same session). Requires figuring out how to trigger compaction programmatically via the Claude Agent SDK.
+The security layers are additive — they wrap existing logic without modifying it.
 
 ## Requirements
 
-- macOS or Linux
+- macOS or Linux (Windows via WSL2 + Docker Desktop)
 - Node.js 20+
 - [Claude Code](https://claude.ai/download)
-- [Apple Container](https://github.com/apple/container) (macOS) or [Docker](https://docker.com/products/docker-desktop) (macOS/Linux)
+- [Docker](https://docker.com/products/docker-desktop) or [Apple Container](https://github.com/apple/container) (macOS)
+- Anthropic API key (also used for Layer 1 skill review)
 
-## Architecture
+## Original NanoClaw
 
-```
-WhatsApp (baileys) --> SQLite --> Polling loop --> Container (Claude Agent SDK) --> Response
-```
+For the upstream project, philosophy, architecture, and full documentation:
 
-Single Node.js process. Agents execute in isolated Linux containers with filesystem isolation. Only mounted directories are accessible. Per-group message queue with concurrency control. IPC via filesystem.
-
-Key files:
-- `src/index.ts` - Orchestrator: state, message loop, agent invocation
-- `src/channels/whatsapp.ts` - WhatsApp connection, auth, send/receive
-- `src/ipc.ts` - IPC watcher and task processing
-- `src/router.ts` - Message formatting and outbound routing
-- `src/group-queue.ts` - Per-group queue with global concurrency limit
-- `src/container-runner.ts` - Spawns streaming agent containers
-- `src/task-scheduler.ts` - Runs scheduled tasks
-- `src/db.ts` - SQLite operations (messages, groups, sessions, state)
-- `groups/*/CLAUDE.md` - Per-group memory
-
-## FAQ
-
-**Why Docker?**
-
-Docker provides cross-platform support (macOS, Linux and even Windows via WSL2) and a mature ecosystem. On macOS, you can optionally switch to Apple Container via `/convert-to-apple-container` for a lighter-weight native runtime.
-
-**Can I run this on Linux?**
-
-Yes. Docker is the default runtime and works on both macOS and Linux. Just run `/setup`.
-
-**Is this secure?**
-
-Agents run in containers, not behind application-level permission checks. They can only access explicitly mounted directories. You should still review what you're running, but the codebase is small enough that you actually can. See [docs/SECURITY.md](docs/SECURITY.md) for the full security model.
-
-**Why no configuration files?**
-
-We don't want configuration sprawl. Every user should customize NanoClaw so that the code does exactly what they want, rather than configuring a generic system. If you prefer having config files, you can tell Claude to add them.
-
-**How do I debug issues?**
-
-Ask Claude Code. "Why isn't the scheduler running?" "What's in the recent logs?" "Why did this message not get a response?" That's the AI-native approach that underlies NanoClaw.
-
-**Why isn't the setup working for me?**
-
-If you have issues, during setup, Claude will try to dynamically fix them. If that doesn't work, run `claude`, then run `/debug`. If Claude finds an issue that is likely affecting other users, open a PR to modify the setup SKILL.md.
-
-**What changes will be accepted into the codebase?**
-
-Only security fixes, bug fixes, and clear improvements will be accepted to the base configuration. That's all.
-
-Everything else (new capabilities, OS compatibility, hardware support, enhancements) should be contributed as skills.
-
-This keeps the base system minimal and lets every user customize their installation without inheriting features they don't want.
-
-## Community
-
-Questions? Ideas? [Join the Discord](https://discord.gg/VDdww8qS42).
+**[github.com/qwibitai/NanoClaw](https://github.com/qwibitai/NanoClaw)**
 
 ## License
 
