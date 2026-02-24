@@ -1,14 +1,12 @@
+<h1 align="center">🛡️ SafeClaw</h1>
+
 <p align="center">
-  <img src="assets/nanoclaw-logo.png" alt="SafeClaw" width="400">
+  Security-hardened fork of <a href="https://github.com/qwibitai/NanoClaw">NanoClaw</a>. Container isolation + 3-layer defense-in-depth.
 </p>
 
 <p align="center">
-  <strong>SafeClaw</strong> — Security-hardened fork of <a href="https://github.com/qwibitai/NanoClaw">NanoClaw</a>. Container isolation + 3-layer defense-in-depth.
-</p>
-
-<p align="center">
-  <a href="https://nanoclaw.dev">nanoclaw.dev</a>&nbsp; • &nbsp;
-  <a href="https://discord.gg/VDdww8qS42"><img src="https://img.shields.io/discord/1470188214710046894?label=Discord&logo=discord&v=2" alt="Discord" valign="middle"></a>
+  <a href="https://github.com/airobotlab/safeclaw">GitHub</a>&nbsp; • &nbsp;
+  <a href="https://github.com/qwibitai/NanoClaw">Upstream NanoClaw</a>
 </p>
 
 ## OpenClaw vs SafeClaw
