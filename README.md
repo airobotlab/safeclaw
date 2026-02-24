@@ -1,4 +1,6 @@
-<h1 align="center">🛡️ SafeClaw</h1>
+<p align="center">
+  <img src="assets/safeclaw-logo.png" alt="SafeClaw" width="400">
+</p>
 
 <p align="center">
   Security-hardened fork of <a href="https://github.com/qwibitai/NanoClaw">NanoClaw</a>. Container isolation + 3-layer defense-in-depth.
